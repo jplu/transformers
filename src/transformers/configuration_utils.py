@@ -193,6 +193,7 @@ class PretrainedConfig(object):
 
         # Optimization attributes
         self.use_einsum = kwargs.pop("use_einsum", True)
+        self.use_old_ebd = kwargs.pop("use_old_ebd", True)
 
         # Parameters for sequence generation
         self.max_length = kwargs.pop("max_length", 20)

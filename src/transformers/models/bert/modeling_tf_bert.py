@@ -241,7 +241,75 @@ class TFBertPositionEmbeddings(tf.keras.layers.Layer):
         return tf.broadcast_to(input=position_embeddings, shape=input_shape)
 
 
-class TFBertEmbeddings(tf.keras.layers.Layer):
+class TFBertOldEmbeddings(tf.keras.layers.Layer):
+    """Construct the embeddings from word, position and token_type embeddings."""
+
+    def __init__(self, config, **kwargs):
+        super().__init__(**kwargs)
+
+        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        self.max_position_embeddings = config.max_position_embeddings
+        self.type_vocab_size = config.type_vocab_size
+        self.initializer_range = config.initializer_range
+        self.embeddings_sum = tf.keras.layers.Add()
+        self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
+        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
+    
+    def build(self, input_shape):
+        with tf.name_scope("word_embeddings"):
+            self.word_embeddings = self.add_weight(
+                name="weight",
+                shape=[self.vocab_size, self.hidden_size],
+                initializer=get_initializer(initializer_range=self.initializer_range),
+            )
+        
+        self.position_embeddings = self.add_weight(
+            name="embeddings",
+            shape=[self.max_position_embeddings, self.hidden_size],
+            initializer=get_initializer(initializer_range=self.initializer_range),
+        )
+
+        self.token_type_embeddings = self.add_weight(
+            name="embeddings",
+            shape=[self.type_vocab_size, self.hidden_size],
+            initializer=get_initializer(initializer_range=self.initializer_range),
+        )
+
+        super().build(input_shape)
+
+    def call(self, input_ids=None, position_ids=None, token_type_ids=None, inputs_embeds=None, training=False):
+        """
+        Applies embedding based on inputs tensor.
+
+        Returns:
+            final_embeddings (:obj:`tf.Tensor`): output embedding tensor.
+        """
+        assert not (input_ids is None and inputs_embeds is None)
+
+        if input_ids is not None:
+            inputs_embeds = tf.gather(self.word_embeddings, input_ids)
+
+        if token_type_ids is None:
+            input_shape = shape_list(tensor=inputs_embeds)[:-1]
+            token_type_ids = tf.fill(dims=input_shape, value=0)
+
+        if position_ids is None:
+            input_shape = shape_list(tensor=inputs_embeds)
+            position_embeds = self.position_embeddings[: input_shape[1], :]
+            position_embeds = tf.broadcast_to(input=position_embeds, shape=input_shape)
+        else:
+            position_embeds = tf.gather(self.position_embeddings, position_ids)
+
+        token_type_embeds = tf.gather(self.token_type_embeddings, token_type_ids)
+        final_embeddings = self.embeddings_sum(inputs=[inputs_embeds, position_embeds, token_type_embeds])
+        final_embeddings = self.LayerNorm(inputs=final_embeddings)
+        final_embeddings = self.dropout(inputs=final_embeddings, training=training)
+
+        return final_embeddings
+
+
+class TFBertNewEmbeddings(tf.keras.layers.Layer):
     """Construct the embeddings from word, position and token_type embeddings."""
 
     def __init__(self, config: BertConfig, **kwargs):
@@ -749,7 +817,10 @@ class TFBertMainLayer(tf.keras.layers.Layer):
 
         self.config = config
 
-        self.embeddings = TFBertEmbeddings(config, name="embeddings")
+        if config.use_old_ebd:
+            self.embeddings = TFBertOldEmbeddings(config, name="embeddings")
+        else:
+            self.embeddings = TFBertNewEmbeddings(config, name="embeddings")
         self.encoder = TFBertEncoder(config, name="encoder")
         self.pooler = TFBertPooler(config, name="pooler") if add_pooling_layer else None
 
