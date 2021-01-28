@@ -361,7 +361,7 @@ class TFBertSelfAttention(tf.keras.layers.Layer):
                 name="value",
             )
 
-        self.dropout = tf.keras.layers.Dropout(config.attention_probs_dropout_prob)
+        self.dropout = tf.keras.layers.Dropout(rate=config.attention_probs_dropout_prob)
 
     def call(
         self,
