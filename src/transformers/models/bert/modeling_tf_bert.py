@@ -375,7 +375,7 @@ class TFBertSelfAttention(tf.keras.layers.Layer):
         key_layer = self.key(inputs=hidden_states)
         value_layer = self.value(inputs=hidden_states)
 
-        # Take the dot product between "query" and "key" to get the raw	
+        # Take the dot product between "query" and "key" to get the raw
         # attention scores.
         dk = tf.cast(self.attention_head_size, dtype=query_layer.dtype)
         query_layer = tf.multiply(query_layer, tf.math.rsqrt(dk))
