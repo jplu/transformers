@@ -64,7 +64,7 @@ class BenchmarkArguments:
         metadata={"help": "Whether to run on available cuda devices. Cuda can be disabled via --no-cuda."},
     )
     tpu: bool = field(
-        default=False, metadata={"help": "Whether to run on available tpu devices. TPU can be disabled via --no-tpu."}
+        default=True, metadata={"help": "Whether to run on available tpu devices. TPU can be disabled via --no-tpu."}
     )
     fp16: bool = field(default=False, metadata={"help": "Use FP16 to accelerate inference."})
     training: bool = field(default=False, metadata={"help": "Benchmark training of model"})
