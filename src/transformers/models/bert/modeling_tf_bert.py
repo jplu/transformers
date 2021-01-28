@@ -52,6 +52,7 @@ from ...modeling_tf_utils import (
     TFQuestionAnsweringLoss,
     TFSequenceClassificationLoss,
     TFTokenClassificationLoss,
+    TFTransformersDense,
     get_initializer,
     input_processing,
     keras_serializable,
@@ -305,57 +306,77 @@ class TFBertEmbeddings(tf.keras.layers.Layer):
 
 
 class TFBertSelfAttention(tf.keras.layers.Layer):
-    def __init__(self, config: BertConfig, **kwargs):
+    def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
 
         if config.hidden_size % config.num_attention_heads != 0:
             raise ValueError(
-                f"The hidden size ({config.hidden_size}) is not a multiple of the number "
-                f"of attention heads ({config.num_attention_heads})"
+                "The hidden size (%d) is not a multiple of the number of attention "
+                "heads (%d)" % (config.hidden_size, config.num_attention_heads)
             )
 
+        self.use_einsum = config.use_einsum
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
 
-        self.query = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cde->abde",
-            output_shape=(None, config.num_attention_heads, self.attention_head_size),
-            bias_axes="de",
-            kernel_initializer=get_initializer(config.initializer_range),
-            name="query",
-        )
-        self.key = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cde->abde",
-            output_shape=(None, config.num_attention_heads, self.attention_head_size),
-            bias_axes="de",
-            kernel_initializer=get_initializer(config.initializer_range),
-            name="key",
-        )
-        self.value = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cde->abde",
-            output_shape=(None, config.num_attention_heads, self.attention_head_size),
-            bias_axes="de",
-            kernel_initializer=get_initializer(config.initializer_range),
-            name="value",
-        )
-        self.dropout = tf.keras.layers.Dropout(rate=config.attention_probs_dropout_prob)
+        if self.use_einsum:
+            self.query = tf.keras.layers.experimental.EinsumDense(
+                equation="abc,cde->abde",
+                output_shape=(None, config.num_attention_heads, self.attention_head_size),
+                bias_axes="de",
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="query",
+            )
+            self.key = tf.keras.layers.experimental.EinsumDense(
+                equation="abc,cde->abde",
+                output_shape=(None, config.num_attention_heads, self.attention_head_size),
+                bias_axes="de",
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="key",
+            )
+            self.value = tf.keras.layers.experimental.EinsumDense(
+                equation="abc,cde->abde",
+                output_shape=(None, config.num_attention_heads, self.attention_head_size),
+                bias_axes="de",
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="value",
+            )
+        else:
+            self.all_head_size = config.num_attention_heads * self.attention_head_size
+            self.query = TFTransformersDense(
+                config,
+                units=self.all_head_size,
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="query",
+            )
+            self.key = TFTransformersDense(
+                config,
+                units=self.all_head_size,
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="key",
+            )
+            self.value = TFTransformersDense(
+                config,
+                units=self.all_head_size,
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="value",
+            )
 
-    def call(
-        self,
-        hidden_states: tf.Tensor,
-        attention_mask: tf.Tensor,
-        head_mask: tf.Tensor,
-        output_attentions: bool,
-        training: bool = False,
-    ) -> Tuple[tf.Tensor]:
+        self.dropout = tf.keras.layers.Dropout(config.attention_probs_dropout_prob)
+
+    def call(self, hidden_states, attention_mask, head_mask, output_attentions, training=False):
         query_layer = self.query(inputs=hidden_states)
         key_layer = self.key(inputs=hidden_states)
         value_layer = self.value(inputs=hidden_states)
 
-        # Take the dot product between "query" and "key" to get the raw
-        # attention scores.
         dk = tf.cast(self.attention_head_size, dtype=query_layer.dtype)
         query_layer = tf.multiply(query_layer, tf.math.rsqrt(dk))
-        attention_scores = tf.einsum("aecd,abcd->acbe", key_layer, query_layer)
+
+        # Take the dot product between "query" and "key" to get the raw
+        # attention scores.
+        if self.use_einsum:
+            attention_scores = tf.einsum("aecd,abcd->acbe", key_layer, query_layer)
+        else:
+            attention_scores = tf.matmul(key_layer, query_layer, transpose_b=True)
 
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in TFBertModel call() function)
@@ -370,47 +391,55 @@ class TFBertSelfAttention(tf.keras.layers.Layer):
 
         # Mask heads if we want to
         if head_mask is not None:
-            attention_probs = tf.multiply(attention_probs, head_mask)
+            attention_scores = tf.multiply(attention_scores, head_mask)
 
-        attention_output = tf.einsum("acbe,aecd->abcd", attention_probs, value_layer)
+        if self.use_einsum:
+            attention_output = tf.einsum("acbe,aecd->abcd", attention_probs, value_layer)
+        else:
+            batch_size = shape_list(hidden_states)[0]
+            attention_output = tf.matmul(attention_probs, value_layer)
+            attention_output = tf.reshape(
+                attention_output, (batch_size, -1, self.all_head_size)
+            )  # (batch_size, seq_len_q, all_head_size)
+
         outputs = (attention_output, attention_probs) if output_attentions else (attention_output,)
 
         return outputs
 
 
 class TFBertSelfOutput(tf.keras.layers.Layer):
-    def __init__(self, config: BertConfig, **kwargs):
+    def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
 
-        if config.hidden_size % config.num_attention_heads != 0:
-            raise ValueError(
-                f"The hidden size ({config.hidden_size}) is not a multiple of the number "
-                f"of attention heads ({config.num_attention_heads})"
+        if config.use_einsum:
+            self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+            self.all_head_size = config.num_attention_heads * self.attention_head_size
+            self.dense = tf.keras.layers.experimental.EinsumDense(
+                equation="abcd,cde->abe",
+                output_shape=(None, self.all_head_size),
+                bias_axes="e",
+                kernel_initializer=get_initializer(initializer_range=config.initializer_range),
+                name="dense",
             )
-
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = config.num_attention_heads * self.attention_head_size
-
-        self.dense = tf.keras.layers.experimental.EinsumDense(
-            equation="abcd,cde->abe",
-            output_shape=(None, self.all_head_size),
-            bias_axes="e",
-            kernel_initializer=get_initializer(config.initializer_range),
-            name="dense",
-        )
+        else:
+            self.dense = tf.keras.layers.Dense(
+                units=config.hidden_size,
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="dense",
+            )
         self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
-        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
 
-    def call(self, hidden_states: tf.Tensor, input_tensor: tf.Tensor, training: bool = False) -> tf.Tensor:
-        hidden_states = self.dense(inputs=hidden_states)
-        hidden_states = self.dropout(inputs=hidden_states, training=training)
-        hidden_states = self.LayerNorm(inputs=hidden_states + input_tensor)
+    def call(self, hidden_states, input_tensor, training=False):
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states, training=training)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
 
         return hidden_states
 
 
 class TFBertAttention(tf.keras.layers.Layer):
-    def __init__(self, config: BertConfig, **kwargs):
+    def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
 
         self.self_attention = TFBertSelfAttention(config, name="self")
@@ -419,71 +448,72 @@ class TFBertAttention(tf.keras.layers.Layer):
     def prune_heads(self, heads):
         raise NotImplementedError
 
-    def call(
-        self,
-        input_tensor: tf.Tensor,
-        attention_mask: tf.Tensor,
-        head_mask: tf.Tensor,
-        output_attentions: bool,
-        training: bool = False,
-    ) -> Tuple[tf.Tensor]:
+    def call(self, input_tensor, attention_mask, head_mask, output_attentions, training=False):
         self_outputs = self.self_attention(
-            hidden_states=input_tensor,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            output_attentions=output_attentions,
-            training=training,
+            input_tensor, attention_mask, head_mask, output_attentions, training=training
         )
-        attention_output = self.dense_output(
-            hidden_states=self_outputs[0], input_tensor=input_tensor, training=training
-        )
+        attention_output = self.dense_output(self_outputs[0], input_tensor, training=training)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
 
         return outputs
 
 
 class TFBertIntermediate(tf.keras.layers.Layer):
-    def __init__(self, config: BertConfig, **kwargs):
+    def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
 
-        self.dense = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cd->abd",
-            output_shape=(None, config.intermediate_size),
-            bias_axes="d",
-            kernel_initializer=get_initializer(config.initializer_range),
-            name="dense",
-        )
+        if config.use_einsum:
+            self.dense = tf.keras.layers.experimental.EinsumDense(
+                equation="abc,cd->abd",
+                output_shape=(None, config.intermediate_size),
+                bias_axes="d",
+                kernel_initializer=get_initializer(initializer_range=config.initializer_range),
+                name="dense",
+            )
+        else:
+            self.dense = tf.keras.layers.Dense(
+                units=config.intermediate_size,
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="dense",
+            )
 
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = get_tf_activation(config.hidden_act)
         else:
             self.intermediate_act_fn = config.hidden_act
 
-    def call(self, hidden_states: tf.Tensor) -> tf.Tensor:
-        hidden_states = self.dense(inputs=hidden_states)
+    def call(self, hidden_states):
+        hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
 
         return hidden_states
 
 
 class TFBertOutput(tf.keras.layers.Layer):
-    def __init__(self, config: BertConfig, **kwargs):
+    def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
 
-        self.dense = tf.keras.layers.experimental.EinsumDense(
-            equation="abc,cd->abd",
-            bias_axes="d",
-            output_shape=(None, config.hidden_size),
-            kernel_initializer=get_initializer(config.initializer_range),
-            name="dense",
-        )
+        if config.use_einsum:
+            self.dense = tf.keras.layers.experimental.EinsumDense(
+                equation="abc,cd->abd",
+                bias_axes="d",
+                output_shape=(None, config.hidden_size),
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="dense",
+            )
+        else:
+            self.dense = tf.keras.layers.Dense(
+                units=config.hidden_size,
+                kernel_initializer=get_initializer(config.initializer_range),
+                name="dense",
+            )
         self.LayerNorm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
-        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
 
-    def call(self, hidden_states: tf.Tensor, input_tensor: tf.Tensor, training: bool = False) -> tf.Tensor:
-        hidden_states = self.dense(inputs=hidden_states)
-        hidden_states = self.dropout(inputs=hidden_states, training=training)
-        hidden_states = self.LayerNorm(inputs=hidden_states + input_tensor)
+    def call(self, hidden_states, input_tensor, training=False):
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states, training=training)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
 
         return hidden_states
 

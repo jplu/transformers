@@ -578,6 +578,25 @@ def init_copy_embeddings(old_embeddings, new_num_tokens):
     return mask, current_weights
 
 
+class TFTransformersDense(tf.keras.layers.Dense):
+    def __init__(self, config, reshape=True, **kwargs):
+        super().__init__(**kwargs)
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.reshape = reshape
+
+    def call(self, inputs):
+        output = super().call(inputs)
+
+        if self.reshape:
+            batch_size = shape_list(inputs)[0]
+
+            return tf.reshape(output, (batch_size, self.num_attention_heads, -1, self.attention_head_size))
+
+        return output
+
+
 class TFPreTrainedModel(tf.keras.Model, TFModelUtilsMixin, TFGenerationMixin):
     r"""
     Base class for all TF models.

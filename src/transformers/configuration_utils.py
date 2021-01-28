@@ -191,6 +191,9 @@ class PretrainedConfig(object):
         self.add_cross_attention = kwargs.pop("add_cross_attention", False)
         self.tie_encoder_decoder = kwargs.pop("tie_encoder_decoder", False)
 
+        # Optimization attributes
+        self.use_einsum = kwargs.pop("use_einsum", True)
+
         # Parameters for sequence generation
         self.max_length = kwargs.pop("max_length", 20)
         self.min_length = kwargs.pop("min_length", 0)
